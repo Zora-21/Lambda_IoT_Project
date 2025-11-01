@@ -1,0 +1,159 @@
+services:
+
+  ###############################
+  #  BATCH LAYER (HADOOP)
+  ###############################
+  
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    platform: linux/amd64
+    container_name: namenode
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    networks:
+      - lambda-net
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    platform: linux/amd64
+    container_name: datanode
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    depends_on:
+      namenode:
+        condition: service_healthy # Attende che il namenode sia 'healthy'
+    networks:
+      - lambda-net
+
+  resourcemanager:
+    image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
+    platform: linux/amd64
+    container_name: resourcemanager
+    ports:
+      - "8088:8088"
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870;datanode:9864"
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+    networks:
+      - lambda-net
+
+  nodemanager:
+    image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.2.1-java8
+    platform: linux/amd64
+    container_name: nodemanager
+    volumes:
+      - ./hadoop-job:/app
+    environment:
+      SERVICE_PRECONDITION: "resourcemanager:8088"
+    depends_on:
+      resourcemanager:
+        condition: service_healthy
+    networks:
+      - lambda-net
+
+  ###############################
+  #  SPEED LAYER (CASSANDRA)
+  ###############################
+  
+  cassandra-seed:
+    image: cassandra:4.1
+    platform: linux/amd64
+    container_name: cassandra-seed
+    restart: on-failure
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+      # CORREZIONE: Mappiamo lo script .cql per creare il keyspace
+      - ./cassandra-config:/docker-entrypoint-initdb.d
+    environment:
+      - CASSANDRA_CLUSTER_NAME=IoTCluster
+      - CASSANDRA_SEEDS=cassandra-seed
+      - MAX_HEAP_SIZE=512M # Limita la RAM per evitare crash
+      - HEAP_NEWSIZE=128M
+    mem_limit: 2g # Limite di memoria per il container
+    networks:
+      - lambda-net
+    # CORREZIONE: Aggiungiamo un healthcheck paziente per Mac M1/M2
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 15s       # Controlla ogni 15 secondi
+      timeout: 10s        # Timeout del check
+      retries: 10         # Riprova 10 volte
+      start_period: 90s   # Ignora i fallimenti per i primi 90 secondi
+
+  cassandra-node1:
+    image: cassandra:4.1
+    platform: linux/amd64
+    container_name: cassandra-node1
+    restart: on-failure
+    environment:
+      - CASSANDRA_CLUSTER_NAME=IoTCluster
+      - CASSANDRA_SEEDS=cassandra-seed
+      - MAX_HEAP_SIZE=512M
+      - HEAP_NEWSIZE=128M
+    mem_limit: 2g
+    depends_on:
+      cassandra-seed: # CORREZIONE: Attende che il seed sia 'healthy'
+        condition: service_healthy
+    networks:
+      - lambda-net
+    # CORREZIONE: Rimosso il 'command: sleep 20...'
+
+  ###############################
+  #  SERVIZI APPLICATIVI
+  ###############################
+
+  iot-producer:
+    build:
+      context: ./iot-producer
+    container_name: iot-producer
+    depends_on:
+      namenode: # CORREZIONE: Attende che Hadoop sia 'healthy'
+        condition: service_healthy
+      cassandra-seed: # CORREZIONE: Attende che Cassandra sia 'healthy'
+        condition: service_healthy
+    networks:
+      - lambda-net
+    restart: on-failure
+
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: dashboard
+    ports:
+      - "5000:5000"
+    # AGGIUNGI QUESTE RIGHE PER ATTIVARE IL DEBUG
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+    depends_on:
+      cassandra-seed:
+        condition: service_healthy
+      resourcemanager:
+        condition: service_healthy
+    networks:
+      - lambda-net
+
+# Definizione della rete virtuale
+networks:
+  lambda-net:
+    driver: bridge
+
+# Definizione dei volumi per la persistenza
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+  cassandra_data:

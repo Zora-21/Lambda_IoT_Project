@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard IoT Lambda</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; }
+        h1 { color: #333; }
+        .container { display: flex; gap: 20px; }
+        .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 20px; width: 300px; }
+        .card h2 { margin-top: 0; }
+        .sensor { margin-bottom: 15px; }
+        .sensor h3 { margin-bottom: 5px; color: #555; }
+        .sensor p { margin: 0; font-size: 1.2em; }
+        #loading { display: none; color: #888; }
+    </style>
+</head>
+<body>
+    <h1>Dashboard Architettura Lambda IoT</h1>
+    
+    <div class="container">
+        <div class="card" id="realtime-card">
+            <h2>🌡️ Dati Real-Time (Speed Layer)</h2>
+            <div id="realtime-data">
+                <div class="sensor" id="sensor-A1">
+                    <h3>Sensore A1</h3>
+                    <p>Temp: <span id="A1-temp">...</span></p>
+                    <small>Timestamp: <span id="A1-ts">...</span></small>
+                </div>
+                <div class="sensor" id="sensor-B1">
+                    <h3>Sensore B1</h3>
+                    <p>Temp: <span id="B1-temp">...</span></p>
+                    <small>Timestamp: <span id="B1-ts">...</span></small>
+                </div>
+                <div class="sensor" id="sensor-C1">
+                    <h3>Sensore C1</h3>
+                    <p>Temp: <span id="C1-temp">...</span></p>
+                    <small>Timestamp: <span id="C1-ts">...</span></small>
+                </div>
+            </div>
+            <p id="loading">Aggiornamento...</p>
+        </div>
+
+        <div class="card" id="batch-card">
+            <h2>📊 Dati Storici (Batch Layer)</h2>
+            <p>(Placeholder: qui verrebbero mostrate le medie storiche calcolate da MapReduce)</p>
+            <pre id="batch-data"></pre>
+        </div>
+    </div>
+
+    <script>
+        // Funzione per aggiornare i dati in tempo reale
+        async function fetchRealtimeData() {
+            document.getElementById('loading').style.display = 'block';
+            try {
+                const response = await fetch('/data/realtime');
+                const data = await response.json();
+
+                for (const sensorId in data) {
+                    const sensor = data[sensorId];
+                    document.getElementById(sensorId + '-temp').textContent = sensor.temp + ' °C';
+                    document.getElementById(sensorId + '-ts').textContent = new Date(sensor.timestamp).toLocaleString();
+                }
+            } catch (error) {
+                console.error("Errore nel fetch dei dati realtime:", error);
+            }
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        // Funzione (per ora fittizia) per caricare i dati batch
+        async function fetchBatchData() {
+            try {
+                const response = await fetch('/data/batch');
+                const data = await response.json();
+                document.getElementById('batch-data').textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                console.error("Errore nel fetch dei dati batch:", error);
+            }
+        }
+
+        // Avvia l'aggiornamento all'avvio e poi ogni 3 secondi
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchRealtimeData();
+            fetchBatchData();
+            setInterval(fetchRealtimeData, 3000); // Aggiorna ogni 3 secondi
+        });
+    </script>
+</body>
+</html>
