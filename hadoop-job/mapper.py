@@ -1,5 +1,3 @@
-#/Users/matteo/Documents/Lambda_IoT/hadoop-job/mapper.py
-
 #!/usr/bin/env python3
 """
 mapper.py - Script Map per il job Hadoop Streaming.
@@ -32,12 +30,12 @@ for line in sys.stdin:
             date_str = timestamp_str.split('T')[0]
             
             # Crea la chiave composita
-            output_key = f"{sensor_id}-{date_str}"
+            output_key = "{}-{}".format(sensor_id, date_str)    
             output_value = float(temp)
             
             # Emette la coppia chiave-valore su stdout
             # Hadoop userà questa tabulazione ('\t') come separatore
-            print(f"{output_key}\t{output_value}")
+            print("{}\t{}".format(output_key, output_value))
 
     except Exception as e:
         # Ignora le righe malformate (JSON non validi, ecc.)

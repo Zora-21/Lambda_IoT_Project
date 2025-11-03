@@ -7,16 +7,14 @@ FROM python:3.9-slim
 WORKDIR /app
 
 # Copiamo prima il file dei requisiti
-# (Trucco Docker: questo strato viene messo in cache e non rieseguito se il file non cambia)
 COPY requirements.txt .
 
 # Installiamo le dipendenze Python necessarie
-# --no-cache-dir evita di salvare la cache, mantenendo l'immagine piccola
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiamo il resto del codice sorgente del producer nel container
+# Copiamo il resto del codice sorgente (start.py E producer.py)
 COPY . .
 
 # Comando da eseguire quando il container viene avviato
-# Avvia lo script 'producer.py'
-CMD ["python", "producer.py"]
+# CORREZIONE: Avvia lo script di inizializzazione
+CMD ["python", "start.py"]

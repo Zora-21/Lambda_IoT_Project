@@ -1,5 +1,3 @@
-#/Users/matteo/Documents/Lambda_IoT/hadoop-job/reducer.py
-
 #!/usr/bin/env python3
 """
 reducer.py - Script Reduce per il job Hadoop Streaming.
@@ -37,7 +35,7 @@ for line in sys.stdin:
             if current_key:
                 average = current_sum / current_count
                 # Emette il risultato finale: CHIAVE \t VALORE_MEDIO
-                print(f"{current_key}\t{average:.2f}") # Arrotonda a 2 decimali
+                print("{}\t{:.2f}".format(current_key, average)) # Arrotonda a 2 decimali
 
             # Resetta i contatori per la nuova chiave
             current_key = key
@@ -52,4 +50,4 @@ for line in sys.stdin:
 # Il loop finisce, ma l'ultimo risultato è ancora in memoria.
 if current_key:
     average = current_sum / current_count
-    print(f"{current_key}\t{average:.2f}")
+    print("{}\t{:.2f}".format(current_key, average))

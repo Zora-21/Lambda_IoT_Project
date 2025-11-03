@@ -15,11 +15,12 @@ log = logging.getLogger(__name__)
 
 # --- Variabili di Connessione ---
 CASSANDRA_HOST = 'cassandra-seed'
-CASSANDRA_KEYSPACE = 'moviedb'
+CASSANDRA_KEYSPACE = 'iot_keyspace' # <-- CORREZIONE
 HDFS_HOST = 'namenode'
 HDFS_PORT = 9870
 HDFS_USER = 'root'
-HDFS_PATH = '/iot-data/sensor_logs.jsonl' 
+HDFS_DIR = '/iot-data'
+HDFS_FILE = f"{HDFS_DIR}/sensor_logs.jsonl" # Unico file per i log
 
 def get_cassandra_session():
     """Si connette al cluster Cassandra con una politica di re-try."""
@@ -34,14 +35,25 @@ def get_cassandra_session():
             time.sleep(5)
 
 def get_hdfs_client():
-    """Si connette a HDFS."""
+    """Si connette a HDFS e assicura che dir E file esistano."""
     while True:
         try:
             client = InsecureClient(f"http://{HDFS_HOST}:{HDFS_PORT}", user=HDFS_USER)
-            base_dir = os.path.dirname(HDFS_PATH)
-            if not client.status(base_dir, strict=False):
-                 client.makedirs(base_dir)
-            log.info("Connesso a HDFS!")
+            
+            # 1. Assicurati che la directory di base esista
+            if not client.status(HDFS_DIR, strict=False):
+                 log.info(f"Creazione directory HDFS: {HDFS_DIR}")
+                 client.makedirs(HDFS_DIR)
+            
+            # 2. NUOVA CORREZIONE: Assicurati che il FILE esista
+            # Altrimenti 'append=True' fallisce.
+            if not client.status(HDFS_FILE, strict=False):
+                log.info(f"Creazione file HDFS vuoto: {HDFS_FILE}")
+                # Scriviamo una stringa vuota per creare il file
+                with client.write(HDFS_FILE, encoding='utf-8', append=False) as writer:
+                    writer.write("") 
+            
+            log.info("Connesso a HDFS e file di log verificato!")
             return client
         except Exception as e:
             log.warning(f"Attesa per HDFS... ({e})")
@@ -72,8 +84,6 @@ def main():
 
     log.info("Inizio invio dati...")
     
-    is_first_write = True 
-    
     try:
         while True:
             data = generate_sensor_data()
@@ -95,22 +105,14 @@ def main():
                 json_data = json.dumps(data_hdfs) + '\n'
                 
                 # --- CORREZIONE LOGICA DI SCRITTURA HDFS ---
-                if is_first_write:
-                    # La prima volta, sovrascrivi (o crea) il file
-                    with hdfs_client.write(HDFS_PATH, encoding='utf-8', overwrite=True) as writer:
-                        writer.write(json_data)
-                    is_first_write = False # Le prossime volte appenderà
-                    log.info(f"Creato file HDFS: {HDFS_PATH}")
-                else:
-                    # Le volte successive, aggiungi in coda (append)
-                    with hdfs_client.write(HDFS_PATH, encoding='utf-8', append=True) as writer:
-                        writer.write(json_data)
+                # Rimuoviamo 'is_first_write'. Usiamo sempre 'append=True'.
+                # InsecureClient crea il file se non esiste quando append=True.
+                with hdfs_client.write(HDFS_FILE, encoding='utf-8', append=True) as writer:
+                    writer.write(json_data)
                 # ----------------------------------------
                     
             except Exception as e:
                 log.error(f"Errore scrittura HDFS: {e}")
-                # Se la scrittura fallisce, riprova a creare il file la prossima volta
-                is_first_write = True 
 
             time.sleep(2)
             

@@ -13,6 +13,9 @@ services:
     environment:
       - CLUSTER_NAME=hadoop-cluster
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_replication=1
+      - HDFS_CONF_dfs_datanode_use_datanode_hostname=true
+      - HDFS_CONF_dfs_client_use_datanode_hostname=true 
     ports:
       - "9870:9870"
       - "9000:9000"
@@ -27,9 +30,12 @@ services:
       - hadoop_datanode:/hadoop/dfs/data
     environment:
       SERVICE_PRECONDITION: "namenode:9870"
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      HDFS_CONF_dfs_replication: 1
+      HDFS_CONF_dfs_datanode_use_datanode_hostname: "true" 
     depends_on:
       namenode:
-        condition: service_healthy # Attende che il namenode sia 'healthy'
+        condition: service_healthy
     networks:
       - lambda-net
 
@@ -50,7 +56,8 @@ services:
       - lambda-net
 
   nodemanager:
-    image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.2.1-java8
+    build:
+      context: ./hadoop-nodemanager-custom
     platform: linux/amd64
     container_name: nodemanager
     volumes:
@@ -76,7 +83,6 @@ services:
       - "9042:9042"
     volumes:
       - cassandra_data:/var/lib/cassandra
-      # CORREZIONE: Mappiamo lo script .cql per creare il keyspace
       - ./cassandra-config:/docker-entrypoint-initdb.d
     environment:
       - CASSANDRA_CLUSTER_NAME=IoTCluster
@@ -121,9 +127,9 @@ services:
       context: ./iot-producer
     container_name: iot-producer
     depends_on:
-      namenode: # CORREZIONE: Attende che Hadoop sia 'healthy'
+      resourcemanager: # <-- MODIFICATO QUI
         condition: service_healthy
-      cassandra-seed: # CORREZIONE: Attende che Cassandra sia 'healthy'
+      cassandra-seed: 
         condition: service_healthy
     networks:
       - lambda-net

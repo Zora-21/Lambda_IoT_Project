@@ -1,5 +1,3 @@
-# Framework web
 Flask
-
-# Driver ufficiale per Apache Cassandra
 cassandra-driver
+hdfs
