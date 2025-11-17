@@ -24,7 +24,6 @@ except FileNotFoundError:
     print("ATTENZIONE: model.json non trovato. Dati non puliti.", file=sys.stderr)
     pass
 except Exception as e:
-    # --- MODIFICATO: Rimossa f-string ---
     print("Errore nel caricamento di model.json: {}".format(e), file=sys.stderr)
     pass
 # --- Fine ---
@@ -47,49 +46,83 @@ def calculate_metrics_and_print(key, values):
         model_params = anomaly_model.get(sensor_id)
         
         cleaned_values = []
+        discarded_count = 0
+        total_count = len(values) # Conteggio totale prima della pulizia
+
+        # --- INIZIO CORREZIONE LOGICA (Versione 2) ---
         
-        if model_params:
-            mean = model_params.get('mean')
-            std_dev = model_params.get('std_dev')
-            
-            if mean is not None and std_dev is not None and std_dev > 0:
+        # Se non c'è modello, considera tutti i dati como puliti
+        if not model_params:
+            cleaned_values = values
+            discarded_count = 0
+        else:
+            # Se c'è un modello, controlla la std_dev
+            mean = model_params['mean']
+            std_dev = model_params['std_dev']
+
+            # Applica il filtro SOLO se std_dev è significativo (maggiore di ~0)
+            # Se è 0, il filtro scarterebbe tutti i dati, quindi li teniamo.
+            if std_dev > 0.0001: 
                 lower_bound = mean - (3 * std_dev)
                 upper_bound = mean + (3 * std_dev)
                 
-                for ts, temp in values:
-                    if lower_bound <= temp <= upper_bound:
-                        cleaned_values.append((ts, temp))
+                for (timestamp, temp) in values:
+                    if (temp < lower_bound) or (temp > upper_bound):
+                        discarded_count += 1 # Scarta anomalia
+                    else:
+                        cleaned_values.append((timestamp, temp)) # Dato pulito
             else:
+                # Se std_dev è 0.0 (o troppo piccolo), tutti i dati sono "puliti"
                 cleaned_values = values
-        else:
-            cleaned_values = values
-            
-        # --- Fine Filtro ---
-
-        if not cleaned_values:
-            print("Nessun dato 'pulito' per {}".format(key), file=sys.stderr)
-            return
-
-        # --- INIZIO NUOVA MODIFICA: Conteggio Scartati ---
-        total_count = len(values)
-        cleaned_count = len(cleaned_values)
-        discarded_count = total_count - cleaned_count
-        discarded_pct = round((discarded_count / total_count) * 100, 2) if total_count > 0 else 0
-        # --- FINE NUOVA MODIFICA ---
-
-        # 1. Ordina i valori PULITI per timestamp
-        cleaned_values.sort(key=lambda x: x[0])
-        prices = [v[1] for v in cleaned_values]
+                discarded_count = 0
         
-        # 3. Calcola le metriche
-        count = len(prices) # Questo è cleaned_count
-        if count == 0:
+        # --- FINE CORREZIONE ---
+
+        # Se tutti i dati sono stati scartati, invece di tornare senza output
+        # emetti comunque un JSON con i conteggi (count=0) in modo che
+        # i passi successivi (aggregate_stats.py) possano contabilizzare
+        # correttamente i dati scartati.
+        if not cleaned_values:
+            # Log diagnostico
+            print("Dati scartati per {}: Totali={}, Puliti=0".format(key, total_count), file=sys.stderr)
+
+            # Costruisci un oggetto metrics minimale: nessuna metrica numerica utile
+            # ma con i conteggi per consentire l'aggregazione
+            metrics = {
+                "open": None,
+                "close": None,
+                "min": None,
+                "max": None,
+                "count": 0,
+                "total_count": total_count,
+                "discarded_count": discarded_count,
+                "discarded_pct": round((discarded_count / total_count) * 100, 2) if total_count > 0 else 0,
+                "daily_change": None,
+                "daily_change_pct": None,
+                "range_pct": None,
+                "volatility": None,
+                "trend": 0
+            }
+
+            # Stampa comunque la riga attesa da downstream: CHIAVE \t JSON
+            print("{}\t{}".format(key, json.dumps(metrics)))
             return
-            
-        open_price = prices[0]
-        close_price = prices[-1]
-        min_price = min(prices)
-        max_price = max(prices)
+
+        # 1. Ordina i dati puliti per timestamp (crescente)
+        cleaned_values.sort(key=lambda x: x[0])
+        
+        # Estrai solo le temperature per i calcoli
+        temps = [v[1] for v in cleaned_values]
+        
+        # 2. Calcola metriche OHLC
+        open_price = cleaned_values[0][1]
+        close_price = cleaned_values[-1][1]
+        min_price = min(temps)
+        max_price = max(temps)
+        count = len(temps)
+        
+        # 3. Calcola statistiche aggiuntive
+        discarded_pct = (discarded_count / total_count) * 100 if total_count > 0 else 0
         
         daily_change = close_price - open_price
         daily_change_pct = (daily_change / open_price) * 100 if open_price > 0 else 0
@@ -97,22 +130,20 @@ def calculate_metrics_and_print(key, values):
         price_range = max_price - min_price
         range_pct = (price_range / open_price) * 100 if open_price > 0 else 0
         
-        volatility = 0
+        # Volatilità (deviazione standard dei prezzi puliti)
         if count > 1:
-            mean = sum(prices) / count
-            variance = sum((x - mean) ** 2 for x in prices) / (count - 1)
-            std_dev = math.sqrt(variance)
+            mean = sum(temps) / count
+            variance = sum((x - mean) ** 2 for x in temps) / (count - 1)
+            volatility = math.sqrt(variance)
+        else:
+            volatility = 0
             
-            if mean > 0:
-                volatility = (std_dev / mean) * 100
-        
-        trend = "FLAT"
-        if daily_change_pct > 0.5:
-            trend = "UP"
-        elif daily_change_pct < -0.5:
-            trend = "DOWN"
+        # Trend (semplice, +1 se chiude più alto, -1 se più basso)
+        trend = 0
+        if daily_change > 0: trend = 1
+        elif daily_change < 0: trend = -1
 
-        # 4. Componi l'output JSON
+        # 4. Crea l'oggetto JSON di output
         metrics = {
             "open": round(open_price, 2),
             "close": round(close_price, 2),
@@ -156,9 +187,9 @@ for line in sys.stdin:
             current_key = key
             current_values = [(timestamp, temp)]
 
-    except ValueError:
-        pass
+    except Exception:
+        pass # Ignora righe malformate
 
-# Non dimenticare l'ultimo gruppo!
+# Processa l'ultimo gruppo
 if current_key:
     calculate_metrics_and_print(current_key, current_values)

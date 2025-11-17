@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import docker
+import subprocess
+import tempfile
 from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 from cassandra.cluster import Cluster
@@ -23,7 +25,11 @@ HDFS_HOST = os.environ.get('HDFS_HOST', 'namenode')
 HDFS_PORT = os.environ.get('HDFS_PORT', 9870)
 HDFS_USER = os.environ.get('HDFS_USER', 'root')
 HDFS_OUTPUT_DIR = '/iot-output/daily-averages'
-HDFS_DISCARD_STATS_PATH = '/models/discard_stats.json' # Per i contatori scarti
+HDFS_DISCARD_STATS_PATH = '/models/discard_stats.json'
+
+# --- INIZIO MODIFICA: Percorso per le statistiche aggregate micro-batch ---
+HDFS_STATS_DIR = '/iot-stats/daily-aggregate'
+# --- FINE MODIFICA ---
 
 # --- Connessioni Globali ---
 try:
@@ -46,7 +52,6 @@ except Exception as e:
     cassandra_session = None
 
 try:
-    # Questa è la connessione per i grafici di performance
     docker_client = docker.from_env()
     log.info("Connesso a Docker socket.")
 except Exception as e:
@@ -57,12 +62,10 @@ except Exception as e:
 
 @app.route('/')
 def index():
-    """ Serve la pagina index.html (il tuo file). """
-    # Flask cerca 'index.html' nella cartella 'templates'
-    # Assicurati che il tuo file index.html sia in dashboard/templates/index.html
     return render_template('index.html')
 
 # --- 2. API per lo SPEED LAYER (Cassandra) ---
+# (Questa sezione è invariata)
 
 @app.route('/data/realtime')
 def get_realtime_data():
@@ -123,17 +126,31 @@ def get_realtime_trend():
 
 # --- 3. API per il BATCH LAYER (HDFS) ---
 
+# --- INIZIO MODIFICA: Logica di aggregazione Micro-Batch ---
 @app.route('/data/batch')
 def get_batch_data():
     sensor_id = request.args.get('sensor_id')
     if not sensor_id: return jsonify({"error": "sensor_id mancante"}), 400
     if not hdfs_client: return jsonify({"error": "HDFS non connesso"}), 500
-    results = {}
+    
+    today_str = datetime.utcnow().strftime('%Y-%m-%d')
+    date_dir_path = f"{HDFS_OUTPUT_DIR}/date={today_str}"
+    
+    all_micro_batches = []
+    
     try:
-        if not hdfs_client.status(HDFS_OUTPUT_DIR, strict=False):
-            return jsonify({"status": "Directory HDFS non trovata. Esegui il job."})
-        for date_dir_name in hdfs_client.list(HDFS_OUTPUT_DIR):
-            part_file_path = f"{HDFS_OUTPUT_DIR}/{date_dir_name}/part-00000"
+        # 1. Controlla se la directory della data esiste
+        if not hdfs_client.status(date_dir_path, strict=False):
+            return jsonify({"status": "Directory HDFS non trovata. Attendi il prossimo job."})
+        
+        # 2. Lista tutte le directory dei micro-batch (es. time=18-30-00)
+        time_dirs = hdfs_client.list(date_dir_path)
+        if not time_dirs:
+            return jsonify({"status": "Nessun micro-batch trovato per oggi. Attendi."})
+        
+        # 3. Leggi il file part-00000 da OGNI micro-batch
+        for time_dir in sorted(time_dirs): # Ordina per ora
+            part_file_path = f"{date_dir_path}/{time_dir}/part-00000"
             if hdfs_client.status(part_file_path, strict=False):
                 with hdfs_client.read(part_file_path, encoding='utf-8') as reader:
                     for line in reader:
@@ -141,22 +158,57 @@ def get_batch_data():
                         if not line: continue
                         try:
                             key, json_str = line.split('\t', 1)
-                            if key.startswith(sensor_id + '-'):
+                            # Salva solo i dati del sensore richiesto
+                            if key == f"{sensor_id}-{today_str}":
                                 metrics = json.loads(json_str)
-                                date_key = key.split('-', 1)[1] 
-                                results[date_key] = metrics
+                                all_micro_batches.append(metrics)
                         except (ValueError, json.JSONDecodeError) as e:
-                            log.warning(f"Errore nel parsing della riga batch: {line[:100]}... - {e}")
+                            log.warning(f"Errore parsing riga batch: {line[:100]}... - {e}")
                             continue
-        if not results: return jsonify({"status": f"Nessun dato batch trovato per {sensor_id}. Esegui il job."})
-        sorted_results = dict(sorted(results.items()))
-        return jsonify(sorted_results)
+                            
+        if not all_micro_batches:
+            return jsonify({"status": f"Nessun dato batch trovato per {sensor_id}. Attendi."})
+        
+        # 4. Aggrega i risultati dei micro-batch in una singola metrica "Daily"
+        final_metrics = {
+            "open": all_micro_batches[0]['open'], # Open del primo batch
+            "close": all_micro_batches[-1]['close'], # Close dell'ultimo batch
+            "min": min(b['min'] for b in all_micro_batches),
+            "max": max(b['max'] for b in all_micro_batches),
+            "count": sum(b['count'] for b in all_micro_batches),
+            "total_count": sum(b['total_count'] for b in all_micro_batches),
+            "discarded_count": sum(b['discarded_count'] for b in all_micro_batches),
+        }
+        
+        # Ricalcola le percentuali basate sui dati aggregati
+        open_price = final_metrics['open']
+        close_price = final_metrics['close']
+        
+        daily_change = close_price - open_price
+        daily_change_pct = (daily_change / open_price) * 100 if open_price > 0 else 0
+        
+        price_range = final_metrics['max'] - final_metrics['min']
+        range_pct = (price_range / open_price) * 100 if open_price > 0 else 0
+        
+        final_metrics["daily_change"] = round(daily_change, 2)
+        final_metrics["daily_change_pct"] = round(daily_change_pct, 2)
+        final_metrics["range_pct"] = round(range_pct, 2)
+        
+        # La volatilità è troppo complessa da ricalcolare, usiamo la media
+        avg_volatility = sum(b['volatility'] for b in all_micro_batches) / len(all_micro_batches)
+        final_metrics["volatility"] = round(avg_volatility, 2)
+
+        # La dashboard si aspetta un dizionario {data: metriche}
+        return jsonify({today_str: final_metrics})
+
     except Exception as e:
         log.error(f"Errore durante la lettura dei dati batch da HDFS: {e}")
         return jsonify({"error": f"Errore HDFS: {e}"}), 500
+# --- FINE MODIFICA ---
+
 
 # --- 4. API per l'Avvio del Job (Docker) ---
-
+# (Invariato)
 @app.route('/trigger-job', methods=['POST'])
 def trigger_mapreduce_job():
     if not docker_client: return jsonify({"error": "Docker client non inizializzato"}), 500
@@ -175,12 +227,9 @@ def trigger_mapreduce_job():
         return jsonify({"error": str(e)}), 500
 
 # --- 5. API per le PRESTAZIONI (Docker Stats) ---
-
+# (Invariato)
 @app.route('/data/performance')
 def get_system_performance():
-    """
-    Recupera le statistiche di utilizzo per i grafici di performance.
-    """
     if not docker_client: 
         log.error("API Performance: Docker client non connesso.")
         return jsonify({"error": "Docker client non connesso"}), 500
@@ -198,28 +247,19 @@ def get_system_performance():
                 container = docker_client.containers.get(container_name)
                 stats = container.stats(stream=False) 
                 
-                # 1. Memoria (MB)
                 mem_usage = stats['memory_stats'].get('usage', 0) / (1024 * 1024)
                 
-                # 2. Rete (MB)
                 net_rx = 0
                 net_tx = 0
-                # --- INIZIO CORREZIONE ---
-                # Aggiunto controllo 'is not None'
                 if 'networks' in stats and stats['networks'] is not None:
-                # --- FINE CORREZIONE ---
                     for if_name, data in stats['networks'].items():
                         net_rx += data.get('rx_bytes', 0)
                         net_tx += data.get('tx_bytes', 0)
                 
-                # 3. Disco (Scrittura MB)
                 disk_write = 0
-                # --- INIZIO CORREZIONE ---
-                # Aggiunto controllo 'is not None'
                 if 'blkio_stats' in stats and \
                    'io_service_bytes_recursive' in stats['blkio_stats'] and \
                    stats['blkio_stats']['io_service_bytes_recursive'] is not None:
-                # --- FINE CORREZIONE ---
                     for item in stats['blkio_stats']['io_service_bytes_recursive']:
                         if item['op'] == 'Write': disk_write += item['value']
                 
@@ -243,15 +283,61 @@ def get_system_performance():
         log.error(f"Errore grave durante il recupero delle statistiche Docker: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- 6. API per STATISTICHE SCARTI ---
+# --- 6. API per STATISTICHE AGGREGATE (Dati Puliti + Scartati) ---
 
-# In dashboard/app.py - QUESTA FUNZIONE E' CORRETTA
+# --- INIZIO MODIFICA: Aggregazione Micro-Batch per le statistiche ---
+@app.route('/data/aggregate_stats')
+def get_aggregate_stats():
+    if not hdfs_client:
+        return jsonify({"error": "HDFS non connesso"}), 500
+    
+    today_str = datetime.utcnow().strftime('%Y-%m-%d')
+    date_dir_path = f"{HDFS_STATS_DIR}/date={today_str}"
+    
+    total_clean = 0
+    total_discarded = 0
+    total_processed = 0
+    
+    try:
+        # 1. Controlla se la directory della data esiste
+        if not hdfs_client.status(date_dir_path, strict=False):
+            log.warning(f"Directory statistiche non trovata: {date_dir_path}")
+            return jsonify({"total_clean": 0, "total_discarded": 0, "total_processed": 0})
+        
+        # 2. Lista tutte le directory dei micro-batch (es. time=18-30-00)
+        time_dirs = hdfs_client.list(date_dir_path)
+        if not time_dirs:
+            return jsonify({"total_clean": 0, "total_discarded": 0, "total_processed": 0})
 
+        # 3. Leggi il file aggregate_stats.json da OGNI micro-batch
+        for time_dir in time_dirs:
+            stats_file_path = f"{date_dir_path}/{time_dir}/aggregate_stats.json"
+            if hdfs_client.status(stats_file_path, strict=False):
+                try:
+                    with hdfs_client.read(stats_file_path, encoding='utf-8') as reader:
+                        stats = json.load(reader)
+                        total_clean += stats.get("total_clean", 0)
+                        total_discarded += stats.get("total_discarded", 0)
+                        total_processed += stats.get("total_processed", 0)
+                except Exception as e:
+                    log.warning(f"Impossibile leggere il file di statistiche {stats_file_path}: {e}")
+
+        return jsonify({
+            "total_clean": total_clean,
+            "total_discarded": total_discarded,
+            "total_processed": total_processed
+        })
+    
+    except Exception as e:
+        log.error(f"Errore durante il calcolo aggregate_stats: {e}")
+        return jsonify({"total_clean": 0, "total_discarded": 0, "total_processed": 0})
+# --- FINE MODIFICA ---
+
+
+# --- 7. API per STATISTICHE SCARTI (Speed Layer) ---
+# (Invariato)
 @app.route('/data/discard_stats')
 def get_discard_stats():
-    """
-    Legge il file di stato degli scarti da HDFS e lo restituisce.
-    """
     if not hdfs_client: 
         return jsonify({"error": "HDFS non connesso"}), 500
     
@@ -265,12 +351,11 @@ def get_discard_stats():
         with hdfs_client.read(HDFS_DISCARD_STATS_PATH, encoding='utf-8') as reader:
             stats = json.load(reader)
         
-        # Questa logica è corretta. Calcola il totale al volo.
         try:
             previous = int(stats.get("previous") or 0)
             current = int(stats.get("current") or 0)
-            stats["previous"] = previous # Assicura che siano numeri
-            stats["current"] = current   # Assicura che siano numeri
+            stats["previous"] = previous
+            stats["current"] = current
             stats["total"] = previous + current
         except (ValueError, TypeError):
             stats["total"] = 0

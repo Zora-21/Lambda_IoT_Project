@@ -3,7 +3,7 @@ import logging
 import subprocess
 from cassandra.cluster import Cluster
 from cassandra.policies import DCAwareRoundRobinPolicy
-from hdfs import InsecureClient
+from hdfs import InsecureClient  # Per la connessione a HDFS
 
 # --- Impostazioni ---
 logging.basicConfig(level=logging.INFO)
@@ -14,6 +14,7 @@ HDFS_HOST = 'namenode'
 HDFS_PORT = 9870
 HDFS_USER = 'root'
 HDFS_DIR = '/iot-data'
+HDFS_MODEL_PATH = '/models/model.json'
 
 # Comandi CQL da eseguire
 CQL_CREATE_KEYSPACE = """
@@ -73,11 +74,60 @@ def initialize_cassandra():
             cluster.shutdown()
 
 
+def initialize_hdfs():
+    """
+    Si connette a HDFS e crea le directory base se necessarie.
+    Ritorna il client HDFS.
+    """
+    from hdfs import InsecureClient
+    
+    log.info("Avvio inizializzazione HDFS...")
+    hdfs_client = None
+    
+    while not hdfs_client:
+        try:
+            client = InsecureClient(f"http://{HDFS_HOST}:{HDFS_PORT}", user=HDFS_USER)
+            
+            # Crea directory base se non esiste
+            if not client.status(HDFS_DIR, strict=False):
+                log.info(f"Creazione directory HDFS di base: {HDFS_DIR}")
+                client.makedirs(HDFS_DIR)
+            
+            # Crea directory modelli se non esiste
+            if not client.status('/models', strict=False):
+                log.info("Creazione directory HDFS per i modelli: /models")
+                client.makedirs('/models')
+            
+            log.info("Connesso a HDFS!")
+            hdfs_client = client
+            
+        except Exception as e:
+            log.warning(f"Attesa per HDFS... ({e})")
+            time.sleep(5)
+    
+    return hdfs_client
+
+
+def remove_old_model(hdfs_client):
+    """
+    Rimuove il vecchio modello da HDFS all'avvio, per garantire una partenza pulita.
+    """
+    try:
+        if hdfs_client.status(HDFS_MODEL_PATH, strict=False):
+            log.info(f"Rimozione modello vecchio: {HDFS_MODEL_PATH}")
+            hdfs_client.delete(HDFS_MODEL_PATH)
+            log.info("Modello vecchio rimosso con successo.")
+        else:
+            log.info("Nessun modello vecchio trovato. Avvio pulito.")
+    except Exception as e:
+        log.error(f"Errore durante la rimozione del modello vecchio: {e}")
+
+
 def main():
     """
     Script di avvio:
     1. Inizializza Cassandra (crea keyspace/tabella)
-    2. (Opzionale: potresti aggiungere qui l'init di HDFS)
+    2. Inizializza HDFS e rimuove il modello vecchio
     """
     
     # Diamo un po' di tempo ai servizi dipendenti per avviarsi
@@ -86,21 +136,12 @@ def main():
 
     initialize_cassandra()
     
+    hdfs_client = initialize_hdfs()
+    
+    # Rimuove il modello vecchio per garantire una partenza pulita
+    remove_old_model(hdfs_client)
+    
     log.info("--- Inizializzazione completata ---")
-    
-    # ---- (MODIFICA QUI) ----
-    # Rimuovi o commenta le righe seguenti:
-    
-    # log.info("Avvio di producer.py...")
-    # try:
-    #     # Usiamo 'exec' per sostituire questo script con quello del producer
-    #     subprocess.run(["python", "producer.py"], check=True)
-    # except subprocess.CalledProcessError as e:
-    #     log.error(f"producer.py ha fallito con codice {e.returncode}")
-    # except FileNotFoundError:
-    #     log.error("Errore: 'producer.py' non trovato. Assicurati che sia nella stessa cartella.")
-    
-    log.info("Script di inizializzazione terminato con successo.") # <-- Puoi aggiungere questo
 
 if __name__ == "__main__":
     main()

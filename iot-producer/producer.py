@@ -39,7 +39,7 @@ hdfs_client = None
 cassandra_query = None
 last_data_received_time = None
 
-# --- INIZIO MODIFICA: Variabili per il Modello e Contatori Scarti ---
+# --- Variabili per il Modello e Contatori Scarti ---
 filtering_model = None
 model_lock = threading.Lock() 
 HDFS_MODEL_PATH = '/models/model.json' 
@@ -51,8 +51,49 @@ discard_counter_memory = 0
 discard_lock = threading.Lock() # Lock per il contatore
 HDFS_DISCARD_STATS_PATH = '/models/discard_stats.json'
 HDFS_ROTATE_TRIGGER_PATH = '/models/rotate_trigger'
-# --- FINE MODIFICA ---
 
+# Timeout per operazioni HDFS
+HDFS_TIMEOUT = 15  # secondi
+
+def hdfs_operation_with_timeout(operation_func, timeout=HDFS_TIMEOUT, retries=2):
+    """
+    Esegue un'operazione HDFS con timeout per evitare blocchi indefiniti.
+    Ritorna il risultato o None se timeout/errore.
+    Con retry logic.
+    """
+    for attempt in range(retries):
+        result = [None]
+        error = [None]
+        
+        def run_operation():
+            try:
+                result[0] = operation_func()
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=run_operation, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+        
+        if thread.is_alive():
+            if attempt < retries - 1:
+                log.debug(f"⏱️  HDFS operation timeout ({timeout}s), retry {attempt + 1}/{retries - 1}...")
+                time.sleep(1)  # Attendi prima di riprova
+            else:
+                log.warning(f"⏱️  HDFS operation timeout ({timeout}s) after {retries} retries")
+            continue
+        
+        if error[0]:
+            if attempt < retries - 1:
+                log.debug(f"HDFS operation error: {type(error[0]).__name__}, retry {attempt + 1}/{retries - 1}...")
+                time.sleep(1)
+            else:
+                log.debug(f"HDFS operation error after {retries} retries: {type(error[0]).__name__}: {error[0]}")
+            continue
+        
+        return result[0]
+    
+    return None
 
 def setup_connections():
     """Inizializza o re-inizializza le connessioni globali."""
@@ -94,8 +135,6 @@ def setup_connections():
             log.warning(f"Attesa per HDFS... ({e})")
             time.sleep(5)
 
-# --- INIZIO MODIFICA: Funzioni di Pulizia e Contatori ---
-
 def is_data_clean(sensor_id, temp, model):
     """
     Controlla se un dato è "pulito" secondo il modello 3-Sigma.
@@ -108,6 +147,7 @@ def is_data_clean(sensor_id, temp, model):
     mean = model_params.get('mean')
     std_dev = model_params.get('std_dev')
     
+    # Se std_dev è 0 o nullo, accetta il dato (non possiamo filtrare)
     if mean is None or std_dev is None or std_dev <= 0:
         return True
         
@@ -121,34 +161,147 @@ def is_data_clean(sensor_id, temp, model):
 
 def update_filtering_model():
     """
-    Controlla HDFS per il file model.json.
+    Scarica il modello da HDFS su un file temporaneo locale, poi lo carica.
+    Più robusto di .read() per evitare timeout su stream HTTP.
     """
     global filtering_model, hdfs_client
     
     if not hdfs_client:
-        log.warning("Update Modello: HDFS client non pronto.")
+        log.warning("⚠️  Update Modello: HDFS client non pronto.")
+        return
+
+    import tempfile
+    import shutil
+
+    try:
+        # 1. Verifica esistenza
+        status = hdfs_client.status(HDFS_MODEL_PATH, strict=False)
+        if not status:
+            log.info("⏳ Nessun modello trovato su HDFS.")
+            # NON settiamo a None qui se abbiamo già un modello in memoria, 
+            # manteniamo quello vecchio finché non ne arriva uno nuovo o esplicito reset.
+            return
+
+        log.info(f"📥 Trovato modello ({HDFS_MODEL_PATH})... Download in corso...")
+        
+        # 2. Download atomico su file temporaneo
+        # Usiamo un file temporaneo per evitare blocchi di stream
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            local_tmp_path = tmp_file.name
+
+        try:
+            # Scarica il file da HDFS al path locale
+            hdfs_client.download(HDFS_MODEL_PATH, local_tmp_path, overwrite=True)
+            
+            # 3. Leggi dal file locale
+            with open(local_tmp_path, 'r') as f:
+                content = f.read()
+                
+            if not content or content.strip() == '{}':
+                log.warning("⚠️  Modello scaricato vuoto.")
+                return # Manteniamo il vecchio modello
+
+            new_model_data = json.loads(content)
+            
+            # 4. Aggiorna la variabile globale in thread-safety
+            with model_lock:
+                filtering_model = new_model_data
+                
+            log.info(f"✅ Modello aggiornato con successo! Sensori: {list(filtering_model.keys())}")
+
+        except Exception as e:
+            log.error(f"❌ Errore durante download/parsing modello: {e}")
+            # IMPORTANTE: Non settiamo filtering_model = None. Teniamo quello vecchio.
+
+        finally:
+            # Pulizia file temporaneo
+            if os.path.exists(local_tmp_path):
+                os.remove(local_tmp_path)
+
+    except Exception as e:
+        log.error(f"❌ Errore generale update modello: {e}")
+    """
+    Controlla HDFS per il file model.json con timeout aumentato.
+    """
+    global filtering_model, hdfs_client
+    
+    if not hdfs_client:
+        log.warning("⚠️  Update Modello: HDFS client non pronto.")
         return
 
     try:
+        # Controlla se il file esiste
         status = hdfs_client.status(HDFS_MODEL_PATH, strict=False)
         if not status:
-            log.info("Nessun modello di pulizia (model.json) trovato. Il producer salverà dati grezzi.")
+            log.info("⏳ Nessun modello trovato. Il producer salverà dati grezzi.")
             with model_lock:
                 filtering_model = None
             return
 
-        log.info(f"Trovato modello di pulizia ({HDFS_MODEL_PATH})... Download...")
-        with hdfs_client.read(HDFS_MODEL_PATH, encoding='utf-8') as reader:
-            model_data = json.load(reader)
+        log.info(f"📥 Trovato modello ({HDFS_MODEL_PATH})... Download in corso...")
+        
+        import threading
+        model_data = None
+        read_error = None
+        
+        def read_model():
+            nonlocal model_data, read_error
+            try:
+                with hdfs_client.read(HDFS_MODEL_PATH, encoding='utf-8') as reader:
+                    content = reader.read()
+                    
+                    if not content or content.strip() == '{}':
+                        log.warning("⚠️  Modello vuoto. In attesa del training...")
+                        model_data = None
+                        return
+                    
+                    model_data = json.loads(content)
+            except Exception as e:
+                read_error = e
+        
+        read_thread = threading.Thread(target=read_model, daemon=True)
+        read_thread.daemon = True
+        read_thread.start()
+        
+        # --- TIMEOUT ADATTIVO ---
+        # Se abbiamo già un modello in cache, usiamo timeout breve (5s)
+        # Altrimenti aspettiamo più a lungo (20s) per il primo caricamento
+        adaptive_timeout = 5 if filtering_model is not None else 20
+        read_thread.join(timeout=adaptive_timeout)
+        
+        if read_thread.is_alive():
+            log.warning("⏱️  TIMEOUT nella lettura del modello ({}s). Mantengo il modello precedente.".format(adaptive_timeout))
+            # Se abbiamo un modello in cache, lo manteniamo
+            # Altrimenti lo settiamo a None (che era il comportamento precedente)
+            if filtering_model is None:
+                log.error("❌ Nessun modello disponibile. I dati saranno scartati.")
+            return
+        
+        if read_error:
+            log.error(f"❌ Errore nella lettura del modello da HDFS: {type(read_error).__name__}: {read_error}")
+            with model_lock:
+                filtering_model = None
+            return
+        
+        if model_data is None:
+            with model_lock:
+                filtering_model = None
+            return
         
         with model_lock:
             filtering_model = model_data
         
-        log.info("Modello di pulizia caricato/aggiornato con successo in memoria.")
+        log.info(f"✅ Modello caricato! Sensori: {list(filtering_model.keys())}")
+    
+    except json.JSONDecodeError as e:
+        log.error(f"❌ Errore JSON nel modello: {e}")
+        with model_lock:
+            filtering_model = None
     
     except Exception as e:
-        log.error(f"Errore durante il caricamento del modello da HDFS: {e}")
-        pass
+        log.error(f"❌ Errore caricamento modello: {type(e).__name__}: {e}")
+        with model_lock:
+            filtering_model = None
 
 def rotate_discard_counters():
     """
@@ -159,13 +312,11 @@ def rotate_discard_counters():
     
     log.info("--- Rilevato trigger di rotazione contatori ---")
     
-    # 1. Leggi il contatore di memoria corrente in modo sicuro
     current_job_discards = 0
     with discard_lock:
         current_job_discards = discard_counter_memory
-        discard_counter_memory = 0 # Azzera il contatore
+        discard_counter_memory = 0 
     
-    # 2. Leggi il file di stato precedente da HDFS
     old_stats = {"previous": 0, "current": 0}
     try:
         if hdfs_client.status(HDFS_DISCARD_STATS_PATH, strict=False):
@@ -174,89 +325,81 @@ def rotate_discard_counters():
     except Exception as e:
         log.warning(f"Impossibile leggere il vecchio file di stato degli scarti. Ricomincio da zero. {e}")
 
-    # --- INIZIO CORREZIONE LOGICA ---
-    # 3. Calcola i valori vecchi
     old_previous = old_stats.get("previous", 0)
     old_current = old_stats.get("current", 0)
     
-    # 4. Prepara il nuovo stato
     new_stats = {
-        # Come richiesto: "previous" assume il valore del TOTALE precedente
         "previous": old_previous + old_current, 
-        "current": current_job_discards # Il contatore di memoria diventa il "current"
+        "current": current_job_discards
     }
-    # --- FINE CORREZIONE LOGICA ---
 
-    # 5. Scrivi il nuovo file di stato su HDFS
     try:
         with hdfs_client.write(HDFS_DISCARD_STATS_PATH, encoding='utf-8', overwrite=True) as writer:
             json.dump(new_stats, writer)
         log.info(f"Statistiche scarti aggiornate su HDFS: {new_stats}")
     except Exception as e:
         log.error(f"Impossibile scrivere il nuovo file di stato degli scarti! {e}")
-        # Se fallisce, rimetti il valore nel contatore di memoria per non perderlo
         with discard_lock:
             discard_counter_memory += current_job_discards
 
-    # 6. Rimuovi il file trigger
     try:
         hdfs_client.delete(HDFS_ROTATE_TRIGGER_PATH)
         log.info("File trigger rimosso.")
     except Exception as e:
         log.error(f"Impossibile rimuovere il file trigger! {e}")
 
-# --- FINE MODIFICA ---
 
-
+# --- INIZIO CORREZIONE: GESTIONE STREAM @trade ---
 def on_message(ws, message):
     """
     Callback eseguito per OGNI messaggio ricevuto dal WebSocket.
+    Modificato per gestire lo stream @trade.
     """
     global cassandra_query, hdfs_client, last_data_received_time, discard_counter_memory
     try:
         wrapper = json.loads(message)
         if 'data' not in wrapper:
             return
-        depth_data = wrapper['data']
         
-        if depth_data.get('e') != 'depthUpdate':
+        trade_data = wrapper['data']
+        
+        if trade_data.get('e') != 'trade': # Controlla che sia un trade
             return
 
-        symbol = depth_data['s'].lower() 
+        symbol = trade_data['s'].lower() 
         sensor_id = INVERSE_SENSOR_MAP.get(symbol, "UNKNOWN")
         
-        if sensor_id == "UNKNOWN" or not depth_data.get('b'):
+        if sensor_id == "UNKNOWN":
             return 
         
-        best_bid_price = float(depth_data['b'][0][0]) 
-        timestamp_ms = depth_data['E'] 
+        price = float(trade_data['p']) # 'p' è il prezzo del trade
+        timestamp_ms = trade_data['E'] # 'E' è il timestamp dell'evento
         timestamp = datetime.utcfromtimestamp(timestamp_ms / 1000.0)
 
         data = {
             "sensor_id": sensor_id,
             "timestamp": timestamp,
-            "temp": best_bid_price 
+            "temp": price # temp ora è il prezzo del trade
         }
+        # --- FINE CORREZIONE ---
         
         log.info(f"Dato ricevuto: {data['sensor_id']} | Prezzo: {data['temp']}")
         last_data_received_time = time.time()
 
-        # --- INIZIO MODIFICA: Logica di Scrittura Selettiva e Conteggio Scarti ---
-
+        # --- Logica di Scrittura Selettiva e Conteggio Scarti ---
         is_clean = False
         current_model = None
         
-        with model_lock: # Legge in modo sicuro dal thread
+        with model_lock: 
             if filtering_model:
                 current_model = filtering_model
         
         if current_model:
-            if is_data_clean(sensor_id, best_bid_price, current_model):
+            if is_data_clean(sensor_id, price, current_model):
                 is_clean = True
             else:
-                log.warning(f"DATO FILTRATO (Anomalia): {sensor_id} | Prezzo: {best_bid_price}")
+                log.warning(f"DATO FILTRATO (Anomalia): {sensor_id} | Prezzo: {price}")
                 is_clean = False
-                # Incrementa il contatore degli scarti in memoria
                 with discard_lock:
                     discard_counter_memory += 1
         else:
@@ -269,20 +412,29 @@ def on_message(ws, message):
             HDFS_PARTITION_DIR = f"{HDFS_BASE_DIR}/date={current_date_str}"
             HDFS_FILE = f"{HDFS_PARTITION_DIR}/crypto_trades.jsonl"
 
-            if not hdfs_client.status(HDFS_PARTITION_DIR, strict=False):
-                hdfs_client.makedirs(HDFS_PARTITION_DIR)
+            try:
+                if not hdfs_client.status(HDFS_PARTITION_DIR, strict=False):
+                    hdfs_client.makedirs(HDFS_PARTITION_DIR)
+            except Exception as e:
+                log.debug(f"Errore check dir HDFS: {e}")
 
-            if not hdfs_client.status(HDFS_FILE, strict=False):
-                log.info(f"Creazione file di log: {HDFS_FILE}")
-                with hdfs_client.write(HDFS_FILE, encoding='utf-8', append=False) as writer:
-                    writer.write("") 
+            try:
+                if not hdfs_client.status(HDFS_FILE, strict=False):
+                    log.info(f"Creazione file di log: {HDFS_FILE}")
+                    with hdfs_client.write(HDFS_FILE, encoding='utf-8', append=False) as writer:
+                        writer.write("")
+            except Exception as e:
+                log.debug(f"Errore create file HDFS: {e}")
 
             data_hdfs = data.copy()
             data_hdfs['timestamp'] = data_hdfs['timestamp'].isoformat()
             json_data = json.dumps(data_hdfs) + '\n'
             
-            with hdfs_client.write(HDFS_FILE, encoding='utf-8', append=True) as writer:
-                writer.write(json_data)
+            try:
+                with hdfs_client.write(HDFS_FILE, encoding='utf-8', append=True) as writer:
+                    writer.write(json_data)
+            except Exception as e:
+                log.error(f"Errore scrittura HDFS: {e}")
                 
         except Exception as e:
             log.error(f"Errore scrittura HDFS: {e}")
@@ -297,8 +449,6 @@ def on_message(ws, message):
             except Exception as e:
                 log.error(f"Errore scrittura Cassandra: {e}")
         
-        # --- FINE MODIFICA ---
-
     except Exception as e:
         log.error(f"Errore nell'elaborazione del messaggio: {e} - Messaggio: {message}")
 
@@ -308,11 +458,38 @@ def on_error(ws, error):
 def on_close(ws, close_status_code, close_msg):
     log.info(f"Connessione WebSocket chiusa: {close_msg}")
 
-def on_open(ws):
-    """ Callback eseguito all'apertura della connessione. """
-    log.info("Connessione WebSocket aperta. Sottoscrizione ai flussi...")
+def model_watcher():
+    """
+    Thread separato che aggiorna il modello ogni 60 secondi.
+    Non blocca il WebSocket principale.
+    """
+    global LAST_MODEL_CHECK_TIME
     
-    streams = [f"{symbol}@depth@100ms" for symbol in SENSOR_MAP.values()]
+    log.info("🔄 Model Watcher avviato")
+    
+    while True:
+        try:
+            time.sleep(60)  # Controlla ogni minuto
+            current_time = time.time()
+            
+            # Aggiorna il modello (con timeout interno)
+            log.info("🔄 Controllo periodico aggiornamenti modello da HDFS...")
+            update_filtering_model()
+            LAST_MODEL_CHECK_TIME = current_time
+            
+        except Exception as e:
+            log.error(f"❌ Errore nel model watcher: {type(e).__name__}: {e}")
+            time.sleep(15)  # Attendi 15s prima di riprovare
+
+# --- INIZIO CORREZIONE: SOTTOSCRIZIONE STREAM @trade ---
+def on_open(ws):
+    """ 
+    Callback eseguito all'apertura della connessione. 
+    Modificato per usare lo stream @trade.
+    """
+    log.info("🔗 Connessione WebSocket aperta. Sottoscrizione ai flussi...")
+    
+    streams = [f"{symbol}@trade" for symbol in SENSOR_MAP.values()]
     
     subscribe_message = {
         "method": "SUBSCRIBE",
@@ -320,28 +497,32 @@ def on_open(ws):
         "id": 1
     }
     ws.send(json.dumps(subscribe_message))
-    log.info(f"Sottoscritto a: {streams}")
-
+    log.info(f"📡 Sottoscritto a: {streams}")
+# --- FINE CORREZIONE ---
 
 def main():
     global last_data_received_time, LAST_MODEL_CHECK_TIME
-    log.info("Avvio del producer di dati crypto...")
+    log.info("🚀 Avvio del producer di dati crypto...")
     
     setup_connections()
 
-    log.info("Tentativo di caricamento modello all'avvio (Fase 0)...")
-    update_filtering_model()
-    LAST_MODEL_CHECK_TIME = time.time()
+    log.info("⏳ Fase di raccolta dati per i primi 5 minuti...")
+    startup_time = time.time()
+    model_attempt_start_time = startup_time + 300  # Dopo 5 minuti
     
-    # --- INIZIO MODIFICA: Inizializza il file di stato scarti se non esiste ---
+    # Avvia il thread model watcher (separato, non blocca)
+    watcher_thread = threading.Thread(target=model_watcher, daemon=True)
+    watcher_thread.start()
+    log.info("✅ Model Watcher thread avviato")
+    
+    # Inizializza il file di stato scarti se non esiste
     if hdfs_client and not hdfs_client.status(HDFS_DISCARD_STATS_PATH, strict=False):
-        log.info(f"Inizializzazione file di stato scarti su {HDFS_DISCARD_STATS_PATH}")
+        log.info(f"📝 Inizializzazione file di stato scarti su {HDFS_DISCARD_STATS_PATH}")
         try:
             with hdfs_client.write(HDFS_DISCARD_STATS_PATH, encoding='utf-8', overwrite=True) as writer:
                 json.dump({"previous": 0, "current": 0}, writer)
         except Exception as e:
-            log.error(f"Impossibile inizializzare il file di stato scarti: {e}")
-    # --- FINE MODIFICA ---
+            log.error(f"❌ Impossibile inizializzare file scarti: {e}")
 
     try:
         while True: 
@@ -362,7 +543,7 @@ def main():
             ws_thread.start()
             
             last_data_received_time = time.time()
-            watchdog_timeout = 30 
+            watchdog_timeout = 40
             
             while ws_thread.is_alive():
                 time.sleep(10) # Controlla ogni 10 secondi
@@ -374,19 +555,19 @@ def main():
                     ws_app.close()
                     break 
                 
-                # --- INIZIO MODIFICA: Logica Model Updater E Rotazione Contatori ---
+                # --- Logica Model Updater E Rotazione Contatori ---
                 now = time.time()
-                if (now - LAST_MODEL_CHECK_TIME) > MODEL_CHECK_INTERVAL:
-                    log.info("Controllo periodico aggiornamenti modello da HDFS...")
-                    update_filtering_model()
-                    LAST_MODEL_CHECK_TIME = now
+                
+                if now >= model_attempt_start_time and not filtering_model:
+                    if (now - LAST_MODEL_CHECK_TIME) > MODEL_CHECK_INTERVAL or LAST_MODEL_CHECK_TIME == startup_time:
+                        log.info("🔄 Tentativo di caricamento modello (dopo 5 minuti di raccolta dati)...")
+                        update_filtering_model()
+                        LAST_MODEL_CHECK_TIME = now
                 
                 # Controlla se il cron job ha lasciato il file trigger
                 if hdfs_client and hdfs_client.status(HDFS_ROTATE_TRIGGER_PATH, strict=False):
                     rotate_discard_counters()
                 
-                # --- FINE MODIFICA ---
-            
             ws_thread.join(timeout=5.0) 
             
             log.warning("Connessione WebSocket persa. Riconnessione tra 10 secondi...")

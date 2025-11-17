@@ -21,12 +21,17 @@ services:
       - "9000:9000"
     networks:
       - lambda-net
-    healthcheck: # Aggiunto healthcheck per stabilità
-      test: ["CMD", "hdfs", "dfsadmin", "-report"]
+      
+    # --- INIZIO CORREZIONE ERRORE 1 ---
+    # Questo healthcheck controlla la porta 9870 (WebHDFS) 
+    # di cui 'start.py' ha bisogno, risolvendo il blocco all'avvio.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870/webhdfs/v1/?op=GETFILESTATUS"]
       interval: 10s
       timeout: 10s
       retries: 5
       start_period: 30s
+    # --- FINE CORREZIONE ---
 
   datanode:
     image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
@@ -44,7 +49,7 @@ services:
         condition: service_healthy
     networks:
       - lambda-net
-    healthcheck: # Aggiunto healthcheck per stabilità
+    healthcheck:
       test: ["CMD", "hdfs", "dfsadmin", "-report"]
       interval: 10s
       timeout: 10s
@@ -67,7 +72,7 @@ services:
         condition: service_healthy
     networks:
       - lambda-net
-    healthcheck: # Aggiunto healthcheck per stabilità
+    healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8088/ws/v1/cluster/info"]
       interval: 10s
       timeout: 10s
@@ -104,8 +109,6 @@ services:
       - "9042:9042"
     volumes:
       - cassandra_data:/var/lib/cassandra
-      # Questo file init.cql viene ignorato se usiamo lo script start.py
-      # ma lo lasciamo per completezza se dovessimo rimuovere start.py
       - ./cassandra-config:/docker-entrypoint-initdb.d 
     environment:
       - CASSANDRA_CLUSTER_NAME=IoTCluster
@@ -143,27 +146,27 @@ services:
   #  SERVIZI APPLICATIVI
   ###############################
 
-  init-services: # <-- (1) SERVIZIO NUOVO
+  init-services:
     build:
-      context: ./iot-producer # Riutilizza la stessa immagine del producer
+      context: ./iot-producer
     container_name: init-services
-    command: ["python", "start.py"] # Esegue SOLO lo script di init
+    command: ["python", "start.py"]
     depends_on:
       cassandra-seed:
         condition: service_healthy
       namenode:
-        condition: service_healthy # Aggiungiamo anche HDFS
+        condition: service_healthy # Attende l'healthcheck corretto
     networks:
       - lambda-net
-    restart: on-failure # Riprova se l'init fallisce
+    restart: on-failure
 
   iot-producer:
     build:
       context: ./iot-producer
     container_name: iot-producer
-    command: ["python", "producer.py"] # <-- (2) MODIFICATO: Esegue solo il producer
+    command: ["python", "producer.py"]
     depends_on:
-      init-services: # <-- (3) MODIFICATO: Attende il completamento dell'init
+      init-services:
         condition: service_completed_successfully
     networks:
       - lambda-net
@@ -182,9 +185,8 @@ services:
       - FLASK_ENV=development
       - FLASK_DEBUG=1
     depends_on:
-      init-services: # <-- (4) MODIFICATO: Attende il completamento dell'init
+      init-services:
         condition: service_completed_successfully
-      # Manteniamo le dipendenze originali
       cassandra-seed:
         condition: service_healthy
       resourcemanager:
