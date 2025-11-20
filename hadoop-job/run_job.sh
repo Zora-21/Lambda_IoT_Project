@@ -1,103 +1,101 @@
 #!/bin/bash
 
-# --- Imposta JAVA_HOME per cron ---
+# --- CONFIGURAZIONE ---
 source /opt/hadoop-3.2.1/etc/hadoop/hadoop-env.sh
-
 export HADOOP_HOME=/opt/hadoop-3.2.1
 HDFS_CMD="$HADOOP_HOME/bin/hdfs"
 HADOOP_CMD="$HADOOP_HOME/bin/hadoop"
 HDFS_URI="hdfs://namenode:9000"
 
+# Cartelle
+INCOMING_DIR="/iot-data/incoming"
+ARCHIVE_DIR_BASE="/iot-data/archive"
+INCREMENTAL_OUT="/iot-output/incremental"
+DAILY_SUMMARY_DIR="/iot-stats/daily-summary"
+AGGREGATE_STATS_DIR="/iot-stats/daily-aggregate"
+
 MODEL_FILE_HDFS="/models/model.json"
-MODEL_EXISTS_BEFORE_RUN="no"
+MODEL_LOCAL="/app/model.json"
 
-log() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') - run_job.sh - $1"
-}
-
-if $HDFS_CMD dfs -fs $HDFS_URI -test -e $MODEL_FILE_HDFS; then
-    log "Modello trovato. Si procederà con l'analisi storica (Fase 2 e 3)."
-    MODEL_EXISTS_BEFORE_RUN="yes"
-else
-    log "Modello non trovato. Verrà creato (Fase 1), ma le analisi storiche (Fase 2 e 3) saranno saltate per questo ciclo."
-fi
-
-# --- FASE 1: ADDESTRAMENTO MODELLO (PULIZIA) ---
 TODAY_DATE=$(date +%Y-%m-%d)
 YESTERDAY_DATE=$(date -d "yesterday" +%Y-%m-%d)
+CURRENT_TIME=$(date +%H-%M-%S)
 
-log "Fase 1: Addestramento modello (train_model.py) su dati recenti (ieri e oggi)..."
-MODEL_FILE_PATH="/app/model.json" 
+log() { echo "$(date +'%Y-%m-%d %H:%M:%S') - $1"; }
 
-# Comando 'cat' robusto (Corretto)
-{
-  $HDFS_CMD dfs -fs $HDFS_URI -cat /iot-data/date=$YESTERDAY_DATE/*.jsonl 2>/dev/null
-  $HDFS_CMD dfs -fs $HDFS_URI -cat /iot-data/date=$TODAY_DATE/*.jsonl 2>/dev/null
-} | python3 /app/train_model.py > $MODEL_FILE_PATH
-
-log "Modello salvato localmente in $MODEL_FILE_PATH"
-cat $MODEL_FILE_PATH
-
-log "Caricamento modello aggiornato su HDFS..."
-$HDFS_CMD dfs -fs $HDFS_URI -mkdir -p /models
-$HDFS_CMD dfs -fs $HDFS_URI -put -f $MODEL_FILE_PATH $MODEL_FILE_HDFS
-log "Modello caricato in $MODEL_FILE_HDFS"
-
-
-if [ "$MODEL_EXISTS_BEFORE_RUN" = "yes" ]; then
-
-    # --- FASE 2: JOB MAPREDUCE (Logica Micro-Batch) ---
-    INPUT_DIR="/iot-data/date=$TODAY_DATE/*"
-    
-    # --- INIZIO CORREZIONE LOGICA MICRO-BATCH ---
-    # Crea una directory univoca per questo micro-batch
-    CURRENT_TIME=$(date +%H-%M-%S)
-    OUTPUT_DIR="/iot-output/daily-averages/date=$TODAY_DATE/time=$CURRENT_TIME"
-    # --- FINE CORREZIONE ---
-
-    log "Fase 2: Avvio job MapReduce (Micro-Batch) per i dati di OGGI ($TODAY_DATE)..."
-    
-    # Non cancelliamo più la directory padre, solo quella del job se esiste
-    $HDFS_CMD dfs -fs $HDFS_URI -rm -r -skipTrash $OUTPUT_DIR 2>/dev/null || true
-
-    MAPPER_CMD="python3 /app/mapper.py --filter-minutes 10"
-
-    $HADOOP_CMD jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
-        -D mapred.job.name="Crypto Financial Stats (Micro-Batch) - $TODAY_DATE $CURRENT_TIME" \
-        -fs $HDFS_URI \
-        -files /app/mapper.py,/app/reducer.py,$MODEL_FILE_PATH \
-        -mapper "$MAPPER_CMD" \
-        -reducer "python3 /app/reducer.py" \
-        -input $INPUT_DIR \
-        -output $OUTPUT_DIR
-
-    log "Job completato. Controllo dei risultati (puliti) per $TODAY_DATE $CURRENT_TIME:"
-    $HDFS_CMD dfs -fs $HDFS_URI -cat $OUTPUT_DIR/part-00000 | head
-
-    # --- FASE 3: AGGREGAZIONE STATISTICHE (Logica Micro-Batch) ---
-    log "Fase 3: Aggregazione statistiche finali..."
-    
-    # --- INIZIO CORREZIONE LOGICA MICRO-BATCH ---
-    # Salva le statistiche in un percorso univoco
-    STATS_OUTPUT_PATH="/iot-stats/daily-aggregate/date=$TODAY_DATE/time=$CURRENT_TIME"
-    # --- FINE CORREZIONE ---
-    
-    $HDFS_CMD dfs -fs $HDFS_URI -mkdir -p $STATS_OUTPUT_PATH
-
-    AGGREGATE_JSON=$($HDFS_CMD dfs -fs $HDFS_URI -cat $OUTPUT_DIR/part-00000 | python3 /app/aggregate_stats.py)
-    log "Statistiche aggregate:"
-    echo "$AGGREGATE_JSON"
-
-    echo "$AGGREGATE_JSON" > /tmp/aggregate_stats.json
-    $HDFS_CMD dfs -fs $HDFS_URI -put -f /tmp/aggregate_stats.json $STATS_OUTPUT_PATH/aggregate_stats.json
-    log "✅ Statistiche aggregate salvate in $STATS_OUTPUT_PATH/aggregate_stats.json"
-
-else
-    log "FASE 2 e 3 saltate: Il modello è stato appena creato."
-    log "Le analisi storiche inizieranno al prossimo ciclo."
+# --- 0. CHECK MICRO-BATCH ---
+if ! $HDFS_CMD dfs -fs $HDFS_URI -test -e "$INCOMING_DIR/*.jsonl"; then
+    exit 0
 fi
 
-log "Creazione del file trigger per la rotazione dei contatori..."
-touch /tmp/rotate_trigger_file
-$HDFS_CMD dfs -fs $HDFS_URI -put -f /tmp/rotate_trigger_file /models/rotate_trigger
-log "File trigger caricato in /models/rotate_trigger"
+log "🚀 Avvio Micro-Batch $CURRENT_TIME su dati nuovi..."
+
+# --- FASE 1: TRAINING ---
+{
+  $HDFS_CMD dfs -fs $HDFS_URI -cat "$ARCHIVE_DIR_BASE/date=$YESTERDAY_DATE/*.jsonl" 2>/dev/null
+  $HDFS_CMD dfs -fs $HDFS_URI -cat "$ARCHIVE_DIR_BASE/date=$TODAY_DATE/*.jsonl" 2>/dev/null
+  $HDFS_CMD dfs -fs $HDFS_URI -cat "$INCOMING_DIR/*.jsonl" 2>/dev/null
+} | python3 /app/train_model.py > $MODEL_LOCAL
+
+if [ -s "$MODEL_LOCAL" ]; then
+    $HDFS_CMD dfs -fs $HDFS_URI -put -f $MODEL_LOCAL $MODEL_FILE_HDFS
+fi
+
+# --- FASE 2: MAPREDUCE (SOLO SU INCOMING) ---
+BATCH_OUTPUT_DIR="$INCREMENTAL_OUT/date=$TODAY_DATE/batch_$CURRENT_TIME"
+
+$HADOOP_CMD jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+    -D mapred.job.name="MicroBatch $CURRENT_TIME" \
+    -D mapreduce.job.reduces=1 \
+    -fs $HDFS_URI \
+    -files /app/mapper.py,/app/reducer.py,$MODEL_LOCAL \
+    -mapper "python3 /app/mapper.py" \
+    -reducer "python3 /app/reducer.py" \
+    -input "$INCOMING_DIR/*.jsonl" \
+    -output "$BATCH_OUTPUT_DIR" > /dev/null 2>&1
+
+# --- VARIABILE PER TUTTI I RISULTATI DI OGGI ---
+ALL_BATCHES_RESULTS="$INCREMENTAL_OUT/date=$TODAY_DATE/*/part-00000"
+
+# --- FASE 3: UNIFICAZIONE METRICHE (FIXED) ---
+log "∑ Unificazione risultati giornalieri..."
+SUMMARY_OUTPUT_PATH="$DAILY_SUMMARY_DIR/date=$TODAY_DATE"
+$HDFS_CMD dfs -fs $HDFS_URI -mkdir -p $SUMMARY_OUTPUT_PATH
+
+if $HDFS_CMD dfs -fs $HDFS_URI -test -e "$ALL_BATCHES_RESULTS"; then
+    # --- FIX IMPORTANTE: Scrittura diretta su file (No Variable Capture) ---
+    # Usiamo python3 -u per evitare buffering e > per scrivere su disco
+    $HDFS_CMD dfs -fs $HDFS_URI -cat "$ALL_BATCHES_RESULTS" | python3 -u /app/unify_batches.py > /tmp/daily_unified.json
+    
+    # Controlla se il file locale non è vuoto (-s)
+    if [ -s /tmp/daily_unified.json ]; then
+        $HDFS_CMD dfs -fs $HDFS_URI -put -f /tmp/daily_unified.json "$SUMMARY_OUTPUT_PATH/daily_stats.json"
+        log "✅ Daily Stats generate."
+    else
+        log "⚠️ Daily Stats vuote (Errore Python o Input vuoto)."
+    fi
+fi
+
+# --- FASE 3.5: AGGREGAZIONE STATISTICHE (FIXED) ---
+STATS_OUTPUT_PATH="$AGGREGATE_STATS_DIR/date=$TODAY_DATE"
+$HDFS_CMD dfs -fs $HDFS_URI -mkdir -p $STATS_OUTPUT_PATH
+
+if $HDFS_CMD dfs -fs $HDFS_URI -test -e "$ALL_BATCHES_RESULTS"; then
+    # Anche qui, scrittura diretta
+    $HDFS_CMD dfs -fs $HDFS_URI -cat "$ALL_BATCHES_RESULTS" | python3 -u /app/aggregate_stats.py > /tmp/agg.json
+    
+    if [ -s /tmp/agg.json ]; then
+        $HDFS_CMD dfs -fs $HDFS_URI -put -f /tmp/agg.json "$STATS_OUTPUT_PATH/aggregate_stats.json"
+        log "✅ Aggregate Stats generate."
+    fi
+fi
+
+# --- FASE 4: ARCHIVIAZIONE ---
+DEST_ARCHIVE="$ARCHIVE_DIR_BASE/date=$TODAY_DATE"
+$HDFS_CMD dfs -fs $HDFS_URI -mkdir -p $DEST_ARCHIVE
+
+for file in $($HDFS_CMD dfs -fs $HDFS_URI -ls "$INCOMING_DIR/*.jsonl" | awk '{print $8}'); do
+    $HDFS_CMD dfs -fs $HDFS_URI -mv "$file" "$DEST_ARCHIVE/"
+done
+
+log "✅ Micro-Batch completato e archiviato."

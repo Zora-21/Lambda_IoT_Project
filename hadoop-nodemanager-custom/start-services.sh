@@ -1,18 +1,27 @@
 #!/bin/bash
 
-# 1. Avvia il demone cron in background
+# 1. Avvia il demone cron
+# Non usiamo exec qui, lo lasciamo partire come servizio
 echo "Avvio del demone cron..."
-/usr/sbin/cron
+service cron start || /usr/sbin/cron
 
-# 2. Avvia il tail del log in background (per il debug)
+# 2. Verifica che il file di log esista per il tail
+touch /var/log/cron.log
+
+# 3. Avvia il tail del log in background (per il debug)
 echo "Avvio streaming log di cron..."
 tail -f /var/log/cron.log &
 
-# 3. --- CORREZIONE: Blocco 'sleep 300' rimosso ---
-# Il crontab (*/5) gestirà la prima esecuzione
-# al minuto 5 in modo pulito, senza conflitti.
-echo "Cron è attivo e gestirà l'esecuzione del job."
-
-# 4. Esegui il comando originale del NodeManager in PRIMO PIANO
+# 4. Avvia il NodeManager SENZA 'exec' immediato
+# Questo permette allo script di monitorare entrambi, ma per semplicità in Docker
+# lanciamo il NodeManager come processo finale bloccante, ma senza uccidere cron.
 echo "Avvio del servizio YARN NodeManager..."
+
+# Lanciamo cron e assicuriamoci che resti su
+# Se 'exec' uccideva i processi figli, usiamo questo approccio standard per Docker multi-processo:
+/usr/sbin/cron &
+
+# Ora avvia NodeManager. Usiamo exec per passare i segnali di stop a lui,
+# ma avendo lanciato cron in background SENZA legami stretti, dovrebbe sopravvivere
+# o essere gestito dal processo padre.
 exec yarn nodemanager

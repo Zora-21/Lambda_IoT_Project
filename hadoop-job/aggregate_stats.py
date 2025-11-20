@@ -2,11 +2,14 @@
 """
 aggregate_stats.py
 
-Legge l'output del job MapReduce (reducer.py) da stdin.
-Analizza il JSON di ogni riga per estrarre 'count' (puliti) 
-e 'discarded_count' (scartati).
+Progettato per l'Architettura Incrementale.
+Input (stdin): Flusso di righe JSON multiple. 
+Ogni riga è l'output di un job MapReduce (micro-batch) diverso.
+Esempio Input:
+  {"A1-2023...": {count: 100, discarded: 5...}}
+  {"A1-2023...": {count: 50, discarded: 2...}}
 
-Emette un singolo JSON su stdout con i totali globali.
+Output (stdout): Un singolo JSON aggregato con i totali di TUTTI i batch.
 """
 
 import sys
@@ -15,28 +18,41 @@ import json
 total_clean = 0
 total_discarded = 0
 
+# Legge tutte le righe provenienti da "hdfs dfs -cat .../*/part-00000"
 for line in sys.stdin:
     try:
-        # L'output del reducer è: CHIAVE \t JSON
-        key, json_str = line.strip().split('\t', 1)
+        line = line.strip()
+        if not line:
+            continue
+
+        # L'output del reducer è nel formato: CHIAVE \t JSON
+        # Esempio: "A1-2023-10-27 \t {...}"
+        parts = line.split('\t', 1)
+        if len(parts) < 2:
+            continue
+            
+        json_str = parts[1]
         metrics = json.loads(json_str)
         
-        # 'count' in reducer.py è il conteggio dei dati PULITI
+        # Somma i contatori parziali di questo micro-batch
         total_clean += metrics.get('count', 0) 
-        # 'discarded_count' è il conteggio dei dati SCARTATI
         total_discarded += metrics.get('discarded_count', 0)
         
     except (ValueError, json.JSONDecodeError):
-        # Ignora righe malformate o che non sono output del reducer
+        # Ignora righe che non sono JSON valido (es. log di hadoop spuri)
+        pass
+    except Exception:
         pass
 
-# Calcola il totale complessivo
+# Calcola il totale processato cumulativo
 total_processed = total_clean + total_discarded
 
-# Stampa il JSON finale su stdout
+# Prepara l'output finale per la Dashboard
 output = {
     "total_clean": total_clean,
     "total_discarded": total_discarded,
     "total_processed": total_processed
 }
+
+# Stampa un singolo oggetto JSON su stdout
 print(json.dumps(output, indent=2))
